@@ -1,0 +1,16 @@
+# Gradle caches and generated Android build outputs
+**/.gradle/
+**/build/
+
+# Local Android SDK configuration (machine-specific)
+**/local.properties
+
+# Android Studio workspace metadata
+**/.idea/
+*.iml
+
+# Compiled JVM/Android artifacts
+*.class
+*.dex
+*.apk
+*.aab
