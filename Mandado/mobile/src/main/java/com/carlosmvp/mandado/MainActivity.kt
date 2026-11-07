@@ -722,7 +722,7 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
             s.copy(items = s.items.map { item ->
                 if (item.id == id) item.copy(
                     name = voiceDetailName.trim().ifBlank { item.name },
-                    price = if (voiceDetailPrice.isBlank()) 0.0 else price?.takeIf { it >= 0.0 } ?: item.price
+                    price = if (voiceDetailPrice.isBlank()) 0.0 else price?.takeIf { it.isFinite() && it >= 0.0 } ?: item.price
                 ) else item
             })
         }
@@ -742,7 +742,7 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
             return
         }
         val price = if (newItemPrice.isBlank()) 0.0 else newItemPrice.replace(',', '.').toDoubleOrNull()
-        if (price == null || price < 0.0) {
+        if (price == null || !price.isFinite() || price < 0.0) {
             Toast.makeText(ctx, "Escribe un precio válido", Toast.LENGTH_SHORT).show()
             return
         }
@@ -1448,7 +1448,7 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
             confirmButton = { TextButton(onClick = {
                 val id = priceFor
                 val price = priceText.replace(',', '.').toDoubleOrNull()
-                if (id != null && price != null && price >= 0.0) {
+                if (id != null && price != null && price.isFinite() && price >= 0.0) {
                     Store.updateList(l.id) { s -> s.copy(items = s.items.map { if (it.id == id) it.copy(price = price) else it }) }
                     priceFor = null
                 } else if (priceText.isBlank() && id != null) {
@@ -1548,7 +1548,7 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
                     if (editText.isBlank()) {
                         Store.updateList(l.id) { s -> s.copy(items = s.items.map { if (it.id == id) it.copy(price = 0.0) else it }) }
                         editingItem = null
-                    } else if (price != null && price >= 0.0) {
+                    } else if (price != null && price.isFinite() && price >= 0.0) {
                         Store.updateList(l.id) { s -> s.copy(items = s.items.map { if (it.id == id) it.copy(price = price) else it }) }
                         editingItem = null
                     } else Toast.makeText(ctx, "Ingrese un precio válido", Toast.LENGTH_SHORT).show()

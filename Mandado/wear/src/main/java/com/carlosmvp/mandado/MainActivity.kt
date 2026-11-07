@@ -237,8 +237,10 @@ private fun WatchItemTile(
     var multiFallbackMode by remember { mutableStateOf(false) }
     var voiceAudioLevel by remember { mutableStateOf(-2f) }
     var recognizedVoiceItems by remember { mutableStateOf<List<String>>(emptyList()) }
-    var listsViewMode by remember { mutableIntStateOf(0) }
-    var itemViewMode by remember(sel) { mutableIntStateOf(lists.find { it.id == sel }?.viewMode?.coerceIn(0, 2) ?: 0) }
+    val listsViewMode by Store.mainListsViewMode.collectAsState()
+    var itemViewMode by remember(sel, lists.find { it.id == sel }?.viewMode) {
+        mutableIntStateOf(lists.find { it.id == sel }?.viewMode?.coerceIn(0, 2) ?: 0)
+    }
     var showCheckedItems by remember(sel) { mutableStateOf(false) }
     var expandedItemIds by remember(sel) { mutableStateOf<Set<String>>(emptySet()) }
     var fadingCheckedIds by remember(sel) { mutableStateOf<Set<String>>(emptySet()) }
@@ -499,7 +501,7 @@ private fun WatchItemTile(
             item { Tile("Guardar precio", {
                 val amount = priceDraft.replace(',', '.').toDoubleOrNull()
                 val key = priceTarget
-                if (key != null && amount != null && amount >= 0.0) {
+                if (key != null && amount != null && amount.isFinite() && amount >= 0.0) {
                     Store.updateList(key.first) { s -> s.copy(items = s.items.map { if (it.id == key.second) it.copy(price = amount) else it }) }
                     priceTarget = null
                 } else Toast.makeText(ctx, "Escribe un precio válido", Toast.LENGTH_SHORT).show()
@@ -537,7 +539,7 @@ private fun WatchItemTile(
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text("Mis listas", Modifier.weight(1f), style = MaterialTheme.typography.title3)
                     WatchActionIcon(viewIcon(listsViewMode), "Cambiar a ${viewLabel((listsViewMode + 1) % 3).lowercase()}",
-                        onClick = { listsViewMode = (listsViewMode + 1) % 3 })
+                        onClick = { Store.setMainListsViewMode((listsViewMode + 1) % 3) })
                 }
             }
             if (listsViewMode == 1) {
@@ -595,7 +597,11 @@ private fun WatchItemTile(
                         addingItemText = true
                     }, iconSize = 31.dp)
                     WatchActionIcon(viewIcon(itemViewMode), "Cambiar a ${viewLabel((itemViewMode + 1) % 3).lowercase()}",
-                        onClick = { itemViewMode = (itemViewMode + 1) % 3 })
+                        onClick = {
+                            val nextMode = (itemViewMode + 1) % 3
+                            itemViewMode = nextMode
+                            Store.updateList(l.id) { it.copy(viewMode = nextMode) }
+                        })
                     WatchActionIcon(
                         if (showCheckedItems) Icons.Default.VisibilityOff else Icons.Default.Visibility,
                         if (showCheckedItems) "Ocultar artículos marcados" else "Mostrar artículos marcados",

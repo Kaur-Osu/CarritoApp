@@ -429,7 +429,8 @@ object Store {
     fun parseSpoken(t: String): List<Pair<String, Double>> =
         t.split(Regex(",| y ")).map { it.trim() }.filter { it.isNotEmpty() }.map { s ->
             val m = Regex("^(.*?)\\s+(?:a\\s+)?\\$?(\\d+(?:[.,]\\d+)?)$").find(s)
-            if (m != null) m.groupValues[1] to m.groupValues[2].replace(',', '.').toDouble() else s to 0.0
+            val price = m?.groupValues?.get(2)?.replace(',', '.')?.toDoubleOrNull()
+            if (m != null && price != null && price.isFinite()) m.groupValues[1] to price else s to 0.0
         }
 
     /** Divide transcripción segmentada o puntuada y descarta muletillas aisladas. */
