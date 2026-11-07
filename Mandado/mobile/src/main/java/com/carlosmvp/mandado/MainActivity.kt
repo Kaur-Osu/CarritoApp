@@ -899,18 +899,17 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
         if (showSuggestions && visibleSuggestions.isNotEmpty()) {
             LazyRow(Modifier.fillMaxWidth().height(82.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(horizontal = 2.dp)) {
                 items(visibleSuggestions, key = { it.trim().lowercase() }) { suggestion ->
-                    val otherLists = allLists.filter { it.id != l.id }
-                    val sameStoreLists = if (l.store.isBlank()) emptyList() else otherLists.filter { it.store.trim().equals(l.store.trim(), ignoreCase = true) }
-                    val suggestedItem = (sameStoreLists + otherLists.filterNot { it in sameStoreLists }).asSequence().flatMap { it.items.asSequence() }
-                        .firstOrNull { it.name.equals(suggestion, ignoreCase = true) }
-                    val suggestionImage = remember(suggestedItem?.photo) {
-                        suggestedItem?.photo?.takeIf { it.isNotBlank() }?.let { BitmapFactory.decodeFile(it)?.asImageBitmap() }
+                    val suggestedProduct = remember(l, suggestion, allLists) {
+                        Store.suggestedProduct(l, suggestion)
+                    }
+                    val suggestionImage = remember(suggestedProduct.photo) {
+                        suggestedProduct.photo.takeIf { it.isNotBlank() }?.let { BitmapFactory.decodeFile(it)?.asImageBitmap() }
                     }
                     Box(Modifier.width(104.dp).fillMaxHeight().clip(RoundedCornerShape(10.dp)).clickable {
                         newItemName = suggestion
-                        newItemPrice = ""
-                        newItemPhoto = suggestedItem?.photo.orEmpty()
-                        newItemPhotoSource = suggestedItem?.photoSource.orEmpty()
+                        newItemPrice = suggestedProduct.price.takeIf { it > 0.0 }?.toString().orEmpty()
+                        newItemPhoto = suggestedProduct.photo
+                        newItemPhotoSource = suggestedProduct.photoSource
                         showNewItemPhotoOptions = false
                         showAddItemDialog = true
                     }.background(MaterialTheme.colorScheme.surfaceVariant)) {

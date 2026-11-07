@@ -25,6 +25,7 @@ data class ShopList(val id: String = UUID.randomUUID().toString(), val name: Str
                     val suggestionsVisible: Boolean = true, val itemSortOrder: ItemSortOrder = ItemSortOrder.MANUAL,
                     val storePhotoUpdatedAt: Long = 0L)
 data class StoreShop(val id: String = UUID.randomUUID().toString(), val name: String, val photo: String = "", val photoSource: String = "")
+data class SuggestedProduct(val price: Double, val photo: String, val photoSource: String)
 
 enum class ItemSortOrder { MANUAL, NAME_ASC, NAME_DESC, PRICE_ASC, PRICE_DESC, SUGGESTED }
 
@@ -50,6 +51,8 @@ object Store {
     private val prefs get() = ctx.getSharedPreferences("mandado", 0)
     private data class EncodedPhoto(val signature: String, val hash: String, val bytes: ByteArray)
     private val encodedPhotos = mutableMapOf<String, EncodedPhoto>()
+    private val stateLock = Any()
+    private val deletedListTimes = mutableMapOf<String, Long>()
     private var syncOrigin = ""
     private val photoRefPrefix = "carrito-image://"
 
@@ -58,6 +61,10 @@ object Store {
         ctx = c.applicationContext
         syncOrigin = prefs.getString("syncOrigin", null) ?: UUID.randomUUID().toString().also {
             prefs.edit().putString("syncOrigin", it).apply()
+        }
+        synchronized(deletedListTimes) {
+            deletedListTimes.clear()
+            deletedListTimes.putAll(parseDeletedListTimes(prefs.getString("deletedLists", "{}")!!))
         }
         lists.value = parse(prefs.getString("json", "[]")!!)
         mainListsViewMode.value = prefs.getInt("mainListsViewMode", 0).coerceIn(0, 2)
@@ -93,6 +100,7 @@ object Store {
     private fun receive(data: DataMap) {
         var json = data.getString("json") ?: return
         if (data.getString("origin") == syncOrigin) return
+        mergeDeletedListTimes(parseDeletedListTimes(data.getString("deletedLists") ?: "{}"))
         // Keep an explicit item-id -> asset-hash map alongside the payload. This
         // lets a receiver reconnect photos even if the Data Layer delivers a
         // merged/older JSON value with the Asset entries from the latest update.
@@ -186,43 +194,58 @@ object Store {
                 ?: return path
             return files[hash] ?: syncedPhotoFile(hash).takeIf { it.isFile }?.absolutePath ?: path
         }
-        val currentById = lists.value.associateBy { it.id }
-        val localized = received.map { list ->
-            val previous = currentById[list.id]
-            val incomingStorePhoto = resolve(list.storePhoto)
-            val keepPreviousStorePhoto = previous != null && (
-                previous.storePhotoUpdatedAt > list.storePhotoUpdatedAt ||
-                    (previous.storePhoto.isNotBlank() && File(previous.storePhoto).isFile &&
-                        incomingStorePhoto.isNotBlank() && !File(incomingStorePhoto).isFile &&
-                        previous.storePhotoUpdatedAt == list.storePhotoUpdatedAt)
-                )
-            list.copy(
-                storePhoto = if (keepPreviousStorePhoto) previous!!.storePhoto else incomingStorePhoto.let { path ->
-                    if (path.startsWith(photoRefPrefix) && previous?.storePhoto?.let { File(it).isFile } == true) previous.storePhoto else path
-                },
-                storePhotoSource = if (keepPreviousStorePhoto) previous!!.storePhotoSource else list.storePhotoSource,
-                storePhotoUpdatedAt = maxOf(list.storePhotoUpdatedAt, if (keepPreviousStorePhoto) previous!!.storePhotoUpdatedAt else 0L),
-                items = list.items.map { item ->
-                    val path = resolve(item.photo)
-                    val previousItem = previous?.items?.firstOrNull { it.id == item.id }
-                    val previousPhoto = previousItem?.photo
-                    val keepPreviousPhoto = previousItem != null && (
-                        previousItem.photoUpdatedAt > item.photoUpdatedAt ||
-                            (previousPhoto!!.isNotBlank() && File(previousPhoto).isFile && path.isNotBlank() &&
-                                !File(path).isFile && previousItem.photoUpdatedAt == item.photoUpdatedAt)
-                        )
-                    item.copy(
-                        photo = if (keepPreviousPhoto) previousPhoto!! else if (path.startsWith(photoRefPrefix) && previousPhoto?.let { File(it).isFile } == true) previousPhoto else path,
-                        photoSource = if (keepPreviousPhoto) previousItem!!.photoSource else item.photoSource,
-                        photoUpdatedAt = maxOf(item.photoUpdatedAt, if (keepPreviousPhoto) previousItem!!.photoUpdatedAt else 0L)
+        synchronized(stateLock) {
+            val currentLists = lists.value
+            val currentById = currentLists.associateBy { it.id }
+            val deleted = synchronized(deletedListTimes) { deletedListTimes.toMap() }
+            val receivedIds = received.asSequence()
+                .filter { (deleted[it.id] ?: 0L) < it.createdAt }
+                .map { it.id }
+                .toSet()
+            // Keep local lists that are missing from a stale peer snapshot. Without
+            // this union, opening the phone could replace a newly saved list with an
+            // older Data Layer copy that had not received it yet.
+            val mergedReceived = received.filter { (deleted[it.id] ?: 0L) < it.createdAt } +
+                currentLists.filter { it.id !in receivedIds && (deleted[it.id] ?: 0L) < it.createdAt }
+            val localized = mergedReceived.map { list ->
+                val previous = currentById[list.id]
+                val incomingStorePhoto = resolve(list.storePhoto)
+                val keepPreviousStorePhoto = previous != null && (
+                    previous.storePhotoUpdatedAt > list.storePhotoUpdatedAt ||
+                        (previous.storePhoto.isNotBlank() && File(previous.storePhoto).isFile &&
+                            incomingStorePhoto.isNotBlank() && !File(incomingStorePhoto).isFile &&
+                            previous.storePhotoUpdatedAt == list.storePhotoUpdatedAt)
                     )
-                }
-            )
+                list.copy(
+                    storePhoto = if (keepPreviousStorePhoto) previous!!.storePhoto else incomingStorePhoto.let { path ->
+                        if (path.startsWith(photoRefPrefix) && previous?.storePhoto?.let { File(it).isFile } == true) previous.storePhoto else path
+                    },
+                    storePhotoSource = if (keepPreviousStorePhoto) previous!!.storePhotoSource else list.storePhotoSource,
+                    storePhotoUpdatedAt = maxOf(list.storePhotoUpdatedAt, if (keepPreviousStorePhoto) previous!!.storePhotoUpdatedAt else 0L),
+                    items = list.items.map { item ->
+                        val path = resolve(item.photo)
+                        val previousItem = previous?.items?.firstOrNull { it.id == item.id }
+                        val previousPhoto = previousItem?.photo
+                        val keepPreviousPhoto = previousItem != null && (
+                            previousItem.photoUpdatedAt > item.photoUpdatedAt ||
+                                (previousPhoto!!.isNotBlank() && File(previousPhoto).isFile && path.isNotBlank() &&
+                                    !File(path).isFile && previousItem.photoUpdatedAt == item.photoUpdatedAt)
+                            )
+                        item.copy(
+                            photo = if (keepPreviousPhoto) previousPhoto!! else if (path.startsWith(photoRefPrefix) && previousPhoto?.let { File(it).isFile } == true) previousPhoto else path,
+                            photoSource = if (keepPreviousPhoto) previousItem!!.photoSource else item.photoSource,
+                            photoUpdatedAt = maxOf(item.photoUpdatedAt, if (keepPreviousPhoto) previousItem!!.photoUpdatedAt else 0L)
+                        )
+                    }
+                )
+            }
+            val localJson = toJson(localized)
+            if (localJson == toJson(currentLists)) return
+            val saved = prefs.edit().putString("json", localJson).commit()
+            if (!saved) Log.e("CarritoListSync", "Could not persist merged list state")
+            Log.i("CarritoListSync", "Merged state: local=${currentLists.size}, incoming=${received.size}, saved=${localized.size}, preserved=${localized.count { it.id !in receivedIds }}")
+            lists.value = localized
         }
-        val localJson = toJson(localized)
-        if (localJson == toJson(lists.value)) return
-        prefs.edit().putString("json", localJson).apply()
-        lists.value = localized
     }
 
     private fun syncedPhotoFile(hash: String) = File(File(ctx.filesDir, "synced-photos"), "$hash.img")
@@ -275,32 +298,78 @@ object Store {
     }
 
     fun update(f: (List<ShopList>) -> List<ShopList>) {
-        val previous = lists.value.associateBy { it.id }
-        val now = System.currentTimeMillis()
-        lists.value = f(lists.value).map { list ->
-            val old = previous[list.id]
-            list.copy(
-                storePhotoUpdatedAt = if (old == null && list.storePhoto.isNotBlank()) maxOf(list.storePhotoUpdatedAt, now)
-                    else if (old != null && old.storePhoto != list.storePhoto) maxOf(now, old.storePhotoUpdatedAt + 1L)
-                    else maxOf(list.storePhotoUpdatedAt, old?.storePhotoUpdatedAt ?: 0L),
-                items = list.items.map { item ->
-                    val oldItem = old?.items?.firstOrNull { it.id == item.id }
-                    item.copy(
-                        photoUpdatedAt = if (oldItem == null && item.photo.isNotBlank()) maxOf(item.photoUpdatedAt, now)
-                            else if (oldItem != null && oldItem.photo != item.photo) maxOf(now, oldItem.photoUpdatedAt + 1L)
-                            else maxOf(item.photoUpdatedAt, oldItem?.photoUpdatedAt ?: 0L)
-                    )
-                }
-            )
+        synchronized(stateLock) {
+            val previousLists = lists.value
+            val previous = previousLists.associateBy { it.id }
+            val now = System.currentTimeMillis()
+            val changedLists = f(previousLists)
+            val nextIds = changedLists.mapTo(mutableSetOf()) { it.id }
+            synchronized(deletedListTimes) {
+                (previous.keys - nextIds).forEach { deletedListTimes[it] = now }
+                nextIds.forEach { deletedListTimes.remove(it) }
+            }
+            val nextLists = changedLists.map { list ->
+                val old = previous[list.id]
+                list.copy(
+                    storePhotoUpdatedAt = if (old == null && list.storePhoto.isNotBlank()) maxOf(list.storePhotoUpdatedAt, now)
+                        else if (old != null && old.storePhoto != list.storePhoto) maxOf(now, old.storePhotoUpdatedAt + 1L)
+                        else maxOf(list.storePhotoUpdatedAt, old?.storePhotoUpdatedAt ?: 0L),
+                    items = list.items.map { item ->
+                        val oldItem = old?.items?.firstOrNull { it.id == item.id }
+                        item.copy(
+                            photoUpdatedAt = if (oldItem == null && item.photo.isNotBlank()) maxOf(item.photoUpdatedAt, now)
+                                else if (oldItem != null && oldItem.photo != item.photo) maxOf(now, oldItem.photoUpdatedAt + 1L)
+                                else maxOf(item.photoUpdatedAt, oldItem?.photoUpdatedAt ?: 0L)
+                        )
+                    }
+                )
+            }
+            val j = toJson(nextLists)
+            val saved = prefs.edit().putString("json", j).putString("deletedLists", serializeDeletedListTimes()).commit()
+            if (!saved) Log.e("CarritoListSync", "Could not persist local list state")
+            lists.value = nextLists
+            Log.i("CarritoListSync", "Local state saved: before=${previousLists.size}, after=${nextLists.size}, removed=${previous.keys - nextIds}")
         }
-        val j = toJson(lists.value)
-        prefs.edit().putString("json", j).apply()
         publishCurrentState()
     }
 
+    private fun parseDeletedListTimes(json: String): Map<String, Long> = runCatching {
+        val value = JSONObject(json)
+        buildMap {
+            val keys = value.keys()
+            while (keys.hasNext()) {
+                val id = keys.next()
+                val deletedAt = value.optLong(id, 0L)
+                if (deletedAt > 0L) put(id, deletedAt)
+            }
+        }
+    }.getOrDefault(emptyMap())
+
+    private fun serializeDeletedListTimes(): String {
+        val snapshot = synchronized(deletedListTimes) { deletedListTimes.toMap() }
+        return JSONObject().apply { snapshot.forEach { (id, deletedAt) -> put(id, deletedAt) } }.toString()
+    }
+
+    private fun mergeDeletedListTimes(incoming: Map<String, Long>) {
+        if (incoming.isEmpty()) return
+        synchronized(stateLock) {
+            synchronized(deletedListTimes) {
+                incoming.forEach { (id, deletedAt) ->
+                    if (deletedAt > (deletedListTimes[id] ?: 0L)) deletedListTimes[id] = deletedAt
+                }
+            }
+            val saved = prefs.edit().putString("deletedLists", serializeDeletedListTimes()).commit()
+            if (!saved) Log.e("CarritoListSync", "Could not persist list deletion markers")
+        }
+    }
+
     private fun publishCurrentState() {
+        val (listSnapshot, deletedSnapshot) = synchronized(stateLock) {
+            lists.value to serializeDeletedListTimes()
+        }
         val req = PutDataMapRequest.create("/state").apply {
-            dataMap.putString("json", syncJson(lists.value, dataMap))
+            dataMap.putString("json", syncJson(listSnapshot, dataMap))
+            dataMap.putString("deletedLists", deletedSnapshot)
             dataMap.putString("origin", syncOrigin)
             dataMap.putLong("t", System.nanoTime())
         }.asPutDataRequest().setUrgent()
@@ -408,6 +477,33 @@ object Store {
             }
         }
         return counts.entries.sortedByDescending { it.value.first }.map { it.value.second }
+    }
+
+    /** Reuses details from the same store first, with a cross-store price average as fallback. */
+    fun suggestedProduct(cur: ShopList, name: String): SuggestedProduct {
+        val normalizedName = name.trim().lowercase()
+        val observations = lists.value.asSequence()
+            .filter { it.id != cur.id }
+            .flatMap { list ->
+                list.items.asSequence()
+                    .filter { it.name.trim().lowercase() == normalizedName }
+                    .distinctBy { it.name.trim().lowercase() }
+                    .map { list to it }
+            }
+            .toList()
+        val sameStore = if (cur.store.isBlank()) emptyList() else observations.filter {
+            it.first.store.trim().equals(cur.store.trim(), ignoreCase = true)
+        }
+        val storePrices = sameStore.map { it.second.price }.filter { it > 0.0 }
+        val allPrices = observations.map { it.second.price }.filter { it > 0.0 }
+        val prices = storePrices.ifEmpty { allPrices }
+        val photoSourceItem = sameStore.firstOrNull { it.second.photo.isNotBlank() }
+            ?: observations.firstOrNull { it.second.photo.isNotBlank() }
+        return SuggestedProduct(
+            price = if (prices.isEmpty()) 0.0 else prices.average(),
+            photo = photoSourceItem?.second?.photo.orEmpty(),
+            photoSource = photoSourceItem?.second?.photoSource.orEmpty()
+        )
     }
 
     fun toJson(l: List<ShopList>) = JSONArray(l.map { s ->
