@@ -53,6 +53,7 @@ object Store {
     private val encodedPhotos = mutableMapOf<String, EncodedPhoto>()
     private val stateLock = Any()
     private val deletedListTimes = mutableMapOf<String, Long>()
+    private val deletedItemTimes = mutableMapOf<String, Long>()
     private var syncOrigin = ""
     private val photoRefPrefix = "carrito-image://"
 
@@ -65,6 +66,10 @@ object Store {
         synchronized(deletedListTimes) {
             deletedListTimes.clear()
             deletedListTimes.putAll(parseDeletedListTimes(prefs.getString("deletedLists", "{}")!!))
+        }
+        synchronized(deletedItemTimes) {
+            deletedItemTimes.clear()
+            deletedItemTimes.putAll(parseDeletedItemTimes(prefs.getString("deletedItems", "{}")!!))
         }
         lists.value = parse(prefs.getString("json", "[]")!!)
         mainListsViewMode.value = prefs.getInt("mainListsViewMode", 0).coerceIn(0, 2)
@@ -101,6 +106,7 @@ object Store {
         var json = data.getString("json") ?: return
         if (data.getString("origin") == syncOrigin) return
         mergeDeletedListTimes(parseDeletedListTimes(data.getString("deletedLists") ?: "{}"))
+        mergeDeletedItemTimes(parseDeletedItemTimes(data.getString("deletedItems") ?: "{}"))
         // Keep an explicit item-id -> asset-hash map alongside the payload. This
         // lets a receiver reconnect photos even if the Data Layer delivers a
         // merged/older JSON value with the Asset entries from the latest update.
@@ -198,6 +204,7 @@ object Store {
             val currentLists = lists.value
             val currentById = currentLists.associateBy { it.id }
             val deleted = synchronized(deletedListTimes) { deletedListTimes.toMap() }
+            val deletedItems = synchronized(deletedItemTimes) { deletedItemTimes.toMap() }
             val receivedIds = received.asSequence()
                 .filter { (deleted[it.id] ?: 0L) < it.createdAt }
                 .map { it.id }
@@ -222,7 +229,7 @@ object Store {
                     },
                     storePhotoSource = if (keepPreviousStorePhoto) previous!!.storePhotoSource else list.storePhotoSource,
                     storePhotoUpdatedAt = maxOf(list.storePhotoUpdatedAt, if (keepPreviousStorePhoto) previous!!.storePhotoUpdatedAt else 0L),
-                    items = list.items.map { item ->
+                    items = list.items.filterNot { item -> deletedItems.containsKey(deletedItemKey(list.id, item.id)) }.map { item ->
                         val path = resolve(item.photo)
                         val previousItem = previous?.items?.firstOrNull { it.id == item.id }
                         val previousPhoto = previousItem?.photo
@@ -308,6 +315,17 @@ object Store {
                 (previous.keys - nextIds).forEach { deletedListTimes[it] = now }
                 nextIds.forEach { deletedListTimes.remove(it) }
             }
+            val changedById = changedLists.associateBy { it.id }
+            synchronized(deletedItemTimes) {
+                previousLists.forEach { oldList ->
+                    val newList = changedById[oldList.id] ?: return@forEach
+                    val retainedItemIds = newList.items.mapTo(mutableSetOf()) { it.id }
+                    oldList.items.asSequence().map { it.id }.filterNot { it in retainedItemIds }.forEach { itemId ->
+                        val key = deletedItemKey(oldList.id, itemId)
+                        deletedItemTimes[key] = maxOf(now, (deletedItemTimes[key] ?: 0L) + 1L)
+                    }
+                }
+            }
             val nextLists = changedLists.map { list ->
                 val old = previous[list.id]
                 list.copy(
@@ -325,7 +343,11 @@ object Store {
                 )
             }
             val j = toJson(nextLists)
-            val saved = prefs.edit().putString("json", j).putString("deletedLists", serializeDeletedListTimes()).commit()
+            val saved = prefs.edit()
+                .putString("json", j)
+                .putString("deletedLists", serializeDeletedListTimes())
+                .putString("deletedItems", serializeDeletedItemTimes())
+                .commit()
             if (!saved) Log.e("CarritoListSync", "Could not persist local list state")
             lists.value = nextLists
             Log.i("CarritoListSync", "Local state saved: before=${previousLists.size}, after=${nextLists.size}, removed=${previous.keys - nextIds}")
@@ -345,9 +367,28 @@ object Store {
         }
     }.getOrDefault(emptyMap())
 
+    private fun deletedItemKey(listId: String, itemId: String) = "$listId:$itemId"
+
+    private fun parseDeletedItemTimes(json: String): Map<String, Long> = runCatching {
+        val value = JSONObject(json)
+        buildMap {
+            val keys = value.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                val deletedAt = value.optLong(key, 0L)
+                if (deletedAt > 0L) put(key, deletedAt)
+            }
+        }
+    }.getOrDefault(emptyMap())
+
     private fun serializeDeletedListTimes(): String {
         val snapshot = synchronized(deletedListTimes) { deletedListTimes.toMap() }
         return JSONObject().apply { snapshot.forEach { (id, deletedAt) -> put(id, deletedAt) } }.toString()
+    }
+
+    private fun serializeDeletedItemTimes(): String {
+        val snapshot = synchronized(deletedItemTimes) { deletedItemTimes.toMap() }
+        return JSONObject().apply { snapshot.forEach { (key, deletedAt) -> put(key, deletedAt) } }.toString()
     }
 
     private fun mergeDeletedListTimes(incoming: Map<String, Long>) {
@@ -363,13 +404,27 @@ object Store {
         }
     }
 
+    private fun mergeDeletedItemTimes(incoming: Map<String, Long>) {
+        if (incoming.isEmpty()) return
+        synchronized(stateLock) {
+            synchronized(deletedItemTimes) {
+                incoming.forEach { (key, deletedAt) ->
+                    if (deletedAt > (deletedItemTimes[key] ?: 0L)) deletedItemTimes[key] = deletedAt
+                }
+            }
+            val saved = prefs.edit().putString("deletedItems", serializeDeletedItemTimes()).commit()
+            if (!saved) Log.e("CarritoListSync", "Could not persist item deletion markers")
+        }
+    }
+
     private fun publishCurrentState() {
-        val (listSnapshot, deletedSnapshot) = synchronized(stateLock) {
-            lists.value to serializeDeletedListTimes()
+        val (listSnapshot, deletedSnapshot, deletedItemSnapshot) = synchronized(stateLock) {
+            Triple(lists.value, serializeDeletedListTimes(), serializeDeletedItemTimes())
         }
         val req = PutDataMapRequest.create("/state").apply {
             dataMap.putString("json", syncJson(listSnapshot, dataMap))
             dataMap.putString("deletedLists", deletedSnapshot)
+            dataMap.putString("deletedItems", deletedItemSnapshot)
             dataMap.putString("origin", syncOrigin)
             dataMap.putLong("t", System.nanoTime())
         }.asPutDataRequest().setUrgent()
