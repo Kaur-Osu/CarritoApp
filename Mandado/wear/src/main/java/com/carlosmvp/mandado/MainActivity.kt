@@ -228,6 +228,23 @@ private fun WatchItemTile(
 @Composable fun WatchApp() {
     val ctx = LocalContext.current
     val lists by Store.lists.collectAsState()
+    val phoneConnected by Store.watchPhoneConnected.collectAsState()
+    val watchSyncReady by Store.watchSyncReady.collectAsState()
+    val blockedEdits by Store.blockedWatchEdits.collectAsState()
+    val canEditLists = phoneConnected && watchSyncReady
+    LaunchedEffect(Unit) {
+        while (true) {
+            Store.refreshWatchConnection()
+            delay(2500)
+        }
+    }
+    LaunchedEffect(blockedEdits) {
+        if (blockedEdits > 0) Toast.makeText(ctx, "Conecta tu teléfono y espera a que se sincronicen las listas para hacer cambios", Toast.LENGTH_LONG).show()
+    }
+    fun requirePhoneForChanges(action: () -> Unit) {
+        if (canEditLists) action()
+        else Toast.makeText(ctx, if (phoneConnected) "Sincronizando las listas del teléfono…" else "Conecta tu teléfono para hacer cambios", Toast.LENGTH_SHORT).show()
+    }
     var sel by remember { mutableStateOf<String?>(null) }
     var target by remember { mutableStateOf<Pair<String, String?>?>(null) }
     var confirm by remember { mutableStateOf(false) }
@@ -242,6 +259,7 @@ private fun WatchItemTile(
         mutableIntStateOf(lists.find { it.id == sel }?.viewMode?.coerceIn(0, 2) ?: 0)
     }
     var showCheckedItems by remember(sel) { mutableStateOf(false) }
+    var showCompletionPrompt by remember(sel) { mutableStateOf(false) }
     var expandedItemIds by remember(sel) { mutableStateOf<Set<String>>(emptySet()) }
     var fadingCheckedIds by remember(sel) { mutableStateOf<Set<String>>(emptySet()) }
     val imageCache = remember(sel) { mutableStateMapOf<String, ImageBitmap>() }
@@ -266,7 +284,12 @@ private fun WatchItemTile(
     val visibleLists = lists.filter { it.active }
     val orderedItems = l?.let { current -> sortItems(current.items, current.itemSortOrder) }.orEmpty()
     val visibleItems = orderedItems.filter { showCheckedItems || !it.checked || it.id in fadingCheckedIds }
+    val allItemsChecked = l?.items?.let { it.isNotEmpty() && it.all { product -> product.checked } } ?: false
     val completedTotal = l?.items?.filter { it.checked }?.sumOf { it.price } ?: 0.0
+
+    LaunchedEffect(sel, allItemsChecked) {
+        showCompletionPrompt = allItemsChecked
+    }
 
     fun viewIcon(mode: Int): ImageVector = when (mode) {
         1 -> Icons.Default.GridView
@@ -280,7 +303,23 @@ private fun WatchItemTile(
         else -> "Vista de lista amplia"
     }
 
+    fun restartPurchase() {
+        val listId = l?.id ?: return
+        requirePhoneForChanges {
+            Store.updateList(listId) { current ->
+                current.copy(items = current.items.map { it.copy(checked = false, cartOrder = 0) })
+            }
+            showCheckedItems = false
+            fadingCheckedIds = emptySet()
+            showCompletionPrompt = false
+        }
+    }
+
     fun toggleItem(item: Item) {
+        if (!canEditLists) {
+            requirePhoneForChanges { }
+            return
+        }
         if (!item.checked && !showCheckedItems) {
             fadingCheckedIds = fadingCheckedIds + item.id
             scope.launch {
@@ -293,7 +332,7 @@ private fun WatchItemTile(
     }
 
     val addVoice = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
-        r.spoken()?.let { t -> l?.let { Store.addTo(it.id, Store.parseSpoken(t)) } }
+        r.spoken()?.let { t -> l?.let { list -> requirePhoneForChanges { Store.addTo(list.id, Store.parseSpoken(t)) } } }
     }
     val multiFallbackVoice = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         if (r.resultCode == Activity.RESULT_OK) {
@@ -304,8 +343,10 @@ private fun WatchItemTile(
     }
     val editVoice = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val t = r.spoken(); val tg = target
-        if (t != null && tg != null) Store.updateList(tg.first) { s ->
-            if (tg.second == null) s.copy(name = t) else s.copy(items = s.items.map { if (it.id == tg.second) it.copy(name = t) else it })
+        if (t != null && tg != null) requirePhoneForChanges {
+            Store.updateList(tg.first) { s ->
+                if (tg.second == null) s.copy(name = t) else s.copy(items = s.items.map { if (it.id == tg.second) it.copy(name = t) else it })
+            }
         }
         target = null
     }
@@ -344,7 +385,7 @@ private fun WatchItemTile(
                 voiceAudioLevel = -2f
                 val entries = phrases.flatMap(Store::parseMultipleSpoken)
                 if (entries.isEmpty()) Toast.makeText(ctx, "No se reconocieron artículos", Toast.LENGTH_SHORT).show()
-                else Store.addTo(listId, entries)
+                else requirePhoneForChanges { Store.addTo(listId, entries) }
             },
             onError = {
                 multiSession = null
@@ -375,6 +416,13 @@ private fun WatchItemTile(
     ScalingLazyColumn(Modifier.fillMaxSize().padding(horizontal = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         val tg = target
         val recognizedText = recognizedVoiceItems.flatMap(Store::parseMultipleSpoken).joinToString(", ") { it.first }
+        if (!canEditLists) item {
+            Text(
+                if (phoneConnected) "Sincronizando las listas del teléfono…" else "Conecta tu teléfono para hacer cambios",
+                color = MaterialTheme.colors.secondary,
+                style = MaterialTheme.typography.caption1
+            )
+        }
         if (listeningMulti) {
             item { Text(if (multiFallbackMode) "Artículos dictados" else "Escuchando varios artículos") }
             if (!multiFallbackMode) item { SpeechAudioIndicator(voiceAudioLevel) }
@@ -401,10 +449,12 @@ private fun WatchItemTile(
                     Tile("Agregar artículos", {
                         val entries = recognizedVoiceItems.flatMap(Store::parseMultipleSpoken)
                         if (entries.isEmpty()) Toast.makeText(ctx, "No se reconocieron artículos", Toast.LENGTH_SHORT).show()
-                        else l?.let { Store.addTo(it.id, entries) }
-                        recognizedVoiceItems = emptyList()
-                        multiFallbackMode = false
-                        listeningMulti = false
+                        else l?.let { list -> requirePhoneForChanges {
+                            Store.addTo(list.id, entries)
+                            recognizedVoiceItems = emptyList()
+                            multiFallbackMode = false
+                            listeningMulti = false
+                        } }
                     })
                 }
             } else {
@@ -452,12 +502,12 @@ private fun WatchItemTile(
                 val price = itemPriceDraft.replace(',', '.').toDoubleOrNull()
                 if (name.isEmpty()) Toast.makeText(ctx, "Escribe el nombre del objeto", Toast.LENGTH_SHORT).show()
                 else if (price == null || !price.isFinite() || price < 0.0) Toast.makeText(ctx, "Escribe un precio válido", Toast.LENGTH_SHORT).show()
-                else l?.let {
-                    Store.addTo(it.id, listOf(name to price))
+                else l?.let { list -> requirePhoneForChanges {
+                    Store.addTo(list.id, listOf(name to price))
                     itemNameDraft = ""
                     itemPriceDraft = "0"
                     addingItemText = false
-                }
+                } }
             }) }
             item { Tile("Cancelar", { itemNameDraft = ""; itemPriceDraft = "0"; addingItemText = false }) }
         } else if (textEditTarget != null) {
@@ -475,7 +525,7 @@ private fun WatchItemTile(
             item { Tile("Guardar nombre", {
                 val name = textDraft.trim()
                 if (name.isEmpty()) Toast.makeText(ctx, "Escribe el nombre de la lista", Toast.LENGTH_SHORT).show()
-                else if (key != null) {
+                else if (key != null) requirePhoneForChanges {
                     Store.updateList(key.first) { it.copy(name = name) }
                     textEditTarget = null
                     textDraft = ""
@@ -501,7 +551,7 @@ private fun WatchItemTile(
             item { Tile("Guardar precio", {
                 val amount = priceDraft.replace(',', '.').toDoubleOrNull()
                 val key = priceTarget
-                if (key != null && amount != null && amount.isFinite() && amount >= 0.0) {
+                if (key != null && amount != null && amount.isFinite() && amount >= 0.0) requirePhoneForChanges {
                     Store.updateList(key.first) { s -> s.copy(items = s.items.map { if (it.id == key.second) it.copy(price = amount) else it }) }
                     priceTarget = null
                 } else Toast.makeText(ctx, "Escribe un precio válido", Toast.LENGTH_SHORT).show()
@@ -510,28 +560,29 @@ private fun WatchItemTile(
         } else if (tg != null) {
             item { Text(if (confirm) "¿Seguro que quieres eliminar?" else "Opciones") }
             if (confirm) {
-                item { Tile("Sí, eliminar", {
+                item { Tile("Sí, eliminar", { requirePhoneForChanges {
                     if (tg.second == null) { Store.update { a -> a.filter { it.id != tg.first } }; sel = null }
                     else Store.updateList(tg.first) { s -> s.copy(items = s.items.filter { it.id != tg.second }) }
-                    target = null; confirm = false }) }
+                    target = null; confirm = false
+                } }) }
                 item { Tile("Cancelar", { target = null; confirm = false }) }
             } else {
                 val targetItem = tg.second?.let { itemId -> lists.find { it.id == tg.first }?.items?.find { it.id == itemId } }
                 item { Text(if (targetItem == null) "Lista: ${lists.find { it.id == tg.first }?.name.orEmpty()}" else targetItem.name) }
-                item { Tile("Cambiar nombre con voz", { editVoice.launch(voiceIntent()) }) }
+                item { Tile("Cambiar nombre con voz", { requirePhoneForChanges { editVoice.launch(voiceIntent()) } }) }
                 if (targetItem == null) item {
-                    Tile("Cambiar nombre con texto", {
+                    Tile("Cambiar nombre con texto", { requirePhoneForChanges {
                         textEditTarget = tg.first to null
                         textDraft = lists.find { it.id == tg.first }?.name.orEmpty()
                         target = null
-                    })
+                    } })
                 }
-                if (targetItem != null) item { Tile("Cambiar precio", {
+                if (targetItem != null) item { Tile("Cambiar precio", { requirePhoneForChanges {
                     priceTarget = tg.first to targetItem.id
                     priceDraft = targetItem.price.toString()
                     target = null
-                }) }
-                item { Tile("Eliminar", { confirm = true }) }
+                } }) }
+                item { Tile("Eliminar", { requirePhoneForChanges { confirm = true } }) }
                 item { Tile("Cancelar", { target = null }) }
             }
         } else if (l == null) {
@@ -590,26 +641,42 @@ private fun WatchItemTile(
             }
             item {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
-                    WatchActionIcon(Icons.Default.Mic, "Agregar por voz", onClick = { showVoiceMode = true })
-                    WatchActionIcon(Icons.Default.Add, "Agregar objeto por texto", onClick = {
+                    WatchActionIcon(Icons.Default.Mic, "Agregar por voz", onClick = { requirePhoneForChanges { showVoiceMode = true } })
+                    WatchActionIcon(Icons.Default.Add, "Agregar objeto por texto", onClick = { requirePhoneForChanges {
                         itemNameDraft = ""
                         itemPriceDraft = "0"
                         addingItemText = true
-                    }, iconSize = 31.dp)
+                    } }, iconSize = 31.dp)
                     WatchActionIcon(viewIcon(itemViewMode), "Cambiar a ${viewLabel((itemViewMode + 1) % 3).lowercase()}",
-                        onClick = {
+                        onClick = { requirePhoneForChanges {
                             val nextMode = (itemViewMode + 1) % 3
                             itemViewMode = nextMode
                             Store.updateList(l.id) { it.copy(viewMode = nextMode) }
-                        })
+                        } })
                     WatchActionIcon(
                         if (showCheckedItems) Icons.Default.VisibilityOff else Icons.Default.Visibility,
                         if (showCheckedItems) "Ocultar artículos marcados" else "Mostrar artículos marcados",
                         onClick = { showCheckedItems = !showCheckedItems }
                     )
+                    WatchActionIcon(
+                        Icons.Default.Refresh,
+                        "Volver a empezar la lista",
+                        tint = if (l.items.any { it.checked }) MaterialTheme.colors.secondary else MaterialTheme.colors.onSurfaceVariant,
+                        onClick = {
+                            if (l.items.any { it.checked }) restartPurchase()
+                            else Toast.makeText(ctx, "Todavía no hay artículos marcados", Toast.LENGTH_SHORT).show()
+                        }
+                    )
                 }
             }
-            if (visibleItems.isEmpty()) {
+            if (allItemsChecked && showCompletionPrompt) {
+                item { Text("¡Terminaste tu lista de compra!", style = MaterialTheme.typography.title3, color = MaterialTheme.colors.primary) }
+                item { Text("¿Te gustaría volver a empezar?") }
+                item { Tile("Sí, empezar de nuevo", { restartPurchase() }) }
+                item { Tile("No por ahora", { showCompletionPrompt = false }) }
+            } else if (allItemsChecked && !showCheckedItems) {
+                item { Text("Lista de compra terminada. Puedes volver a marcarla cuando quieras.", color = MaterialTheme.colors.onSurfaceVariant) }
+            } else if (visibleItems.isEmpty()) {
                 item { Text(if (l.items.isEmpty()) "Lista vacía" else "Todo listo" , color = MaterialTheme.colors.onSurfaceVariant) }
             } else if (itemViewMode == 1) {
                 items(visibleItems.chunked(2), key = { row -> row.firstOrNull()?.id ?: "empty" }) { row ->
@@ -619,8 +686,8 @@ private fun WatchItemTile(
                                 item = product, mode = 1, expanded = product.id in expandedItemIds,
                                 onExpand = { expandedItemIds = if (product.id in expandedItemIds) expandedItemIds - product.id else expandedItemIds + product.id },
                                 onToggleCheck = { toggleItem(product) },
-                                onEditName = { target = l.id to product.id; editVoice.launch(voiceIntent()) },
-                                onEditPrice = { priceTarget = l.id to product.id; priceDraft = product.price.toString() },
+                                onEditName = { requirePhoneForChanges { target = l.id to product.id; editVoice.launch(voiceIntent()) } },
+                                onEditPrice = { requirePhoneForChanges { priceTarget = l.id to product.id; priceDraft = product.price.toString() } },
                                 onOptions = { target = l.id to product.id }, imageCache = imageCache,
                                 animateRemoval = product.id in fadingCheckedIds, modifier = Modifier.weight(1f)
                             )
@@ -634,8 +701,8 @@ private fun WatchItemTile(
                         item = product, mode = itemViewMode, expanded = product.id in expandedItemIds,
                         onExpand = { expandedItemIds = if (product.id in expandedItemIds) expandedItemIds - product.id else expandedItemIds + product.id },
                         onToggleCheck = { toggleItem(product) },
-                        onEditName = { target = l.id to product.id; editVoice.launch(voiceIntent()) },
-                        onEditPrice = { priceTarget = l.id to product.id; priceDraft = product.price.toString() },
+                        onEditName = { requirePhoneForChanges { target = l.id to product.id; editVoice.launch(voiceIntent()) } },
+                        onEditPrice = { requirePhoneForChanges { priceTarget = l.id to product.id; priceDraft = product.price.toString() } },
                         onOptions = { target = l.id to product.id }, imageCache = imageCache,
                         animateRemoval = product.id in fadingCheckedIds
                     )

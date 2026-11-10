@@ -74,6 +74,7 @@ import kotlin.math.abs
 private const val STORE_PHOTO_ID = "__store_photo__"
 private const val NEW_ITEM_PHOTO_ID = "__new_item_photo__"
 private const val SHOP_PHOTO_PREFIX = "__catalog_shop__:"
+private const val PHOTO_BACKGROUND_DARKENING = 0.36f
 
 private enum class ListSortOrder { MANUAL, NAME_ASC, NAME_DESC, PRICE_ASC, PRICE_DESC, DATE_ASC, DATE_DESC }
 
@@ -141,15 +142,35 @@ private fun ActionIconButton(icon: ImageVector, label: String, tint: Color = Mat
 class MainActivity : ComponentActivity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b); Store.init(this)
-        setContent { MandadoTheme { App() } }
+        setContent { MandadoTheme { App(onExit = { finish() }) } }
     }
 }
 
-@Composable fun App() {
+@Composable fun App(onExit: () -> Unit) {
     var sel by remember { mutableStateOf<String?>(null) }
+    var showExitConfirmation by remember { mutableStateOf(false) }
     val lists by Store.lists.collectAsState()
     val l = lists.find { it.id == sel }
+    BackHandler(enabled = true) {
+        if (sel != null) sel = null else showExitConfirmation = true
+    }
     if (l == null) Lists(lists) { sel = it } else Items(l) { sel = null }
+    if (showExitConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showExitConfirmation = false },
+            title = { Text("Salir de Carrito") },
+            text = { Text("¿Quieres salir de la app?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showExitConfirmation = false
+                    onExit()
+                }) { Text("Salir") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showExitConfirmation = false }) { Text("Cancelar") }
+            }
+        )
+    }
 }
 
 @Composable
@@ -199,7 +220,7 @@ private fun ShopListCard(list: ShopList, mode: Int, open: (String) -> Unit, sele
             .animateContentSize().border(selectionBorder, MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp))
             .background(cardSurface).then(selectionModifier)) {
             if (image != null) Image(image, "Foto de ${list.store}", Modifier.matchParentSize(), contentScale = ContentScale.Crop)
-            if (image != null) Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.70f)))
+            if (image != null) Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = PHOTO_BACKGROUND_DARKENING)))
             Column(Modifier.align(Alignment.TopStart).fillMaxWidth().padding(10.dp)) {
                 Text(list.name, color = foreground, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Text(details, color = foreground.copy(alpha = 0.9f), style = MaterialTheme.typography.labelSmall)
@@ -214,8 +235,10 @@ private fun ShopListCard(list: ShopList, mode: Int, open: (String) -> Unit, sele
         Row(Modifier.fillMaxWidth().padding(vertical = 5.dp).shadow(2.dp, RoundedCornerShape(12.dp)).clip(RoundedCornerShape(12.dp))
             .animateContentSize().border(selectionBorder, MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp))
             .background(cardSurface).then(selectionModifier), verticalAlignment = Alignment.CenterVertically) {
-            if (image != null) Image(image, "Foto de ${list.store}", Modifier.size(width = 112.dp, height = 104.dp), contentScale = ContentScale.Crop)
-            else Box(Modifier.size(width = 112.dp, height = 104.dp), contentAlignment = Alignment.Center) {
+            if (image != null) Box(Modifier.size(width = 112.dp, height = 104.dp).clip(RoundedCornerShape(10.dp))) {
+                Image(image, "Foto de ${list.store}", Modifier.matchParentSize(), contentScale = ContentScale.Crop)
+                Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = PHOTO_BACKGROUND_DARKENING)))
+            } else Box(Modifier.size(width = 112.dp, height = 104.dp), contentAlignment = Alignment.Center) {
                 Text("Sin foto", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
             }
             Column(Modifier.weight(1f).padding(horizontal = 10.dp, vertical = 6.dp)) {
@@ -230,7 +253,7 @@ private fun ShopListCard(list: ShopList, mode: Int, open: (String) -> Unit, sele
             .animateContentSize().border(selectionBorder, MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp)).then(selectionModifier)) {
             if (image != null) {
                 Image(image, "Foto de ${list.store}", Modifier.matchParentSize(), contentScale = ContentScale.Crop)
-                Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.70f)))
+                Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = PHOTO_BACKGROUND_DARKENING)))
             } else Box(Modifier.matchParentSize().background(MaterialTheme.colorScheme.surfaceVariant))
             Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
@@ -257,7 +280,7 @@ private fun ListReorderRow(list: ShopList, dragHandle: Modifier, modifier: Modif
         Spacer(Modifier.width(8.dp))
         Box(Modifier.weight(1f).height(88.dp).clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colorScheme.surfaceVariant)) {
             if (image != null) Image(image, "Foto de ${list.store}", Modifier.matchParentSize(), contentScale = ContentScale.Crop)
-            if (image != null) Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.62f)))
+            if (image != null) Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = PHOTO_BACKGROUND_DARKENING)))
             Column(Modifier.align(Alignment.CenterStart).padding(horizontal = 12.dp)) {
                 Text(list.name, color = if (image != null) Color.White else MaterialTheme.colorScheme.onSurface,
                     style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -516,7 +539,7 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
                                 .clickable { selectedShopId = shop.id }
                                 .background(if (selectedShopId == shop.id) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant)) {
                                 if (image != null) Image(image, "Foto de ${shop.name}", Modifier.matchParentSize(), contentScale = ContentScale.Crop)
-                                if (image != null) Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.70f)))
+                                if (image != null) Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = PHOTO_BACKGROUND_DARKENING)))
                                 Text(shop.name, Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(6.dp),
                                     color = if (image != null) Color.White else MaterialTheme.colorScheme.onSurface,
                                     style = MaterialTheme.typography.labelMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -575,7 +598,7 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
                                 Box(Modifier.size(width = 76.dp, height = 60.dp).clip(RoundedCornerShape(8.dp))) {
                                     if (image != null) Image(image, "Foto de ${shop.name}", Modifier.matchParentSize(), contentScale = ContentScale.Crop)
                                     else Box(Modifier.matchParentSize().background(MaterialTheme.colorScheme.surface))
-                                    if (image != null) Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.70f)))
+                                    if (image != null) Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = PHOTO_BACKGROUND_DARKENING)))
                                     Text(shop.name.take(1).uppercase(), Modifier.align(Alignment.Center), color = if (image != null) Color.White else MaterialTheme.colorScheme.onSurface)
                                 }
                                 Text(shop.name, Modifier.weight(1f).padding(horizontal = 8.dp), maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -864,7 +887,7 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
         Box(Modifier.fillMaxWidth().height(108.dp).clip(RoundedCornerShape(14.dp)).clickable { storePhotoOptions = true }
             .background(MaterialTheme.colorScheme.surfaceVariant)) {
             if (storeBanner != null) Image(storeBanner, "Foto de ${l.store}", Modifier.matchParentSize(), contentScale = ContentScale.Crop)
-            Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = if (storeBanner == null) 0.08f else 0.68f)))
+            Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = if (storeBanner == null) 0.08f else PHOTO_BACKGROUND_DARKENING)))
             Row(Modifier.fillMaxWidth().align(Alignment.BottomStart).padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(if (l.store.isBlank()) "Foto de la tienda" else l.store, style = MaterialTheme.typography.titleMedium,
@@ -914,7 +937,7 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
                         showAddItemDialog = true
                     }.background(MaterialTheme.colorScheme.surfaceVariant)) {
                         if (suggestionImage != null) Image(suggestionImage, "Foto de $suggestion", Modifier.matchParentSize(), contentScale = ContentScale.Crop)
-                        Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = if (suggestionImage == null) 0f else 0.70f)))
+                        Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = if (suggestionImage == null) 0f else PHOTO_BACKGROUND_DARKENING)))
                         Text(suggestion, Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(6.dp),
                             color = if (suggestionImage == null) MaterialTheme.colorScheme.onSurface else Color.White,
                             style = MaterialTheme.typography.labelMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -1054,7 +1077,7 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
                         .shadow(3.dp, RoundedCornerShape(12.dp)).animateContentSize().border(selectionBorder, MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp))
                         .background(selectionSurface)) {
                         if (img != null) Image(img, "Foto de ${item.name}", Modifier.matchParentSize().then(selectionAwareClick { photoViewerItemId = item.id }), contentScale = ContentScale.Crop)
-                        Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = if (img == null) 0f else 0.70f)))
+                        Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = if (img == null) 0f else PHOTO_BACKGROUND_DARKENING)))
                         Column(Modifier.align(Alignment.TopStart).padding(8.dp)) {
                             Text(item.name, color = if (img != null) Color.White else MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis,
                                 modifier = selectionAwareClick { editingItem = item.id; editingField = "name"; editText = item.name })
@@ -1089,7 +1112,11 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
                     if (itemLayout == 0) {
                         Row(selectionModifier(item).fillMaxWidth().padding(4.dp).animateContentSize()
                             .background(if (selected) listSurface else Color.Transparent), verticalAlignment = Alignment.CenterVertically) {
-                            if (img != null) Image(img, null, Modifier.size(40.dp).padding(end = 8.dp).then(selectionAwareClick { photoViewerItemId = item.id }), contentScale = ContentScale.Crop)
+                            if (img != null) Box(Modifier.size(40.dp).padding(end = 8.dp).clip(RoundedCornerShape(5.dp))
+                                .then(selectionAwareClick { photoViewerItemId = item.id })) {
+                                Image(img, null, Modifier.matchParentSize(), contentScale = ContentScale.Crop)
+                                Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = PHOTO_BACKGROUND_DARKENING)))
+                            }
                             else Text("Sin foto", Modifier.width(52.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
                             Text(item.name, Modifier.weight(1f).then(selectionAwareClick { editingItem = item.id; editingField = "name"; editText = item.name }))
                             if (item.price > 0) Text("$${"%.2f".format(item.price)}", Modifier.then(selectionAwareClick { editingItem = item.id; editingField = "price"; editText = item.price.toString() }).padding(horizontal = 4.dp))
@@ -1107,7 +1134,11 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
                         Row(selectionModifier(item).fillMaxWidth().padding(6.dp).shadow(2.dp, RoundedCornerShape(12.dp)).clip(RoundedCornerShape(12.dp)).animateContentSize()
                             .border(selectionBorder, MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp))
                             .background(listSurface), verticalAlignment = Alignment.CenterVertically) {
-                            if (img != null) Image(img, "Foto de ${item.name}", Modifier.size(104.dp).then(selectionAwareClick { photoViewerItemId = item.id }), contentScale = ContentScale.Crop)
+                            if (img != null) Box(Modifier.size(104.dp).clip(RoundedCornerShape(10.dp))
+                                .then(selectionAwareClick { photoViewerItemId = item.id })) {
+                                Image(img, "Foto de ${item.name}", Modifier.matchParentSize(), contentScale = ContentScale.Crop)
+                                Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = PHOTO_BACKGROUND_DARKENING)))
+                            }
                             else Box(Modifier.size(104.dp), contentAlignment = Alignment.Center) { Text("Sin foto", style = MaterialTheme.typography.labelSmall) }
                             Column(Modifier.weight(1f).padding(start = 12.dp)) {
                                 Text(item.name, style = MaterialTheme.typography.titleMedium, modifier = selectionAwareClick { editingItem = item.id; editingField = "name"; editText = item.name })
@@ -1476,7 +1507,7 @@ private fun ItemReorderRow(item: Item, dragHandle: Modifier, modifier: Modifier 
                                     editingStoreName = false
                                 }.background(MaterialTheme.colorScheme.surfaceVariant)) {
                                 if (image != null) Image(image, "Foto de ${shop.name}", Modifier.matchParentSize(), contentScale = ContentScale.Crop)
-                                if (image != null) Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.70f)))
+                                if (image != null) Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = PHOTO_BACKGROUND_DARKENING)))
                                 Text(shop.name, Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(6.dp),
                                     color = if (image != null) Color.White else MaterialTheme.colorScheme.onSurface,
                                     style = MaterialTheme.typography.labelMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)

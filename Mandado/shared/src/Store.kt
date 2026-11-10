@@ -14,6 +14,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 data class Item(val id: String = UUID.randomUUID().toString(), val name: String, val price: Double = 0.0,
@@ -23,11 +24,15 @@ data class ShopList(val id: String = UUID.randomUUID().toString(), val name: Str
                     val items: List<Item> = emptyList(), val createdAt: Long = System.currentTimeMillis(), val active: Boolean = true,
                     val storePhoto: String = "", val storePhotoSource: String = "", val viewMode: Int = 1,
                     val suggestionsVisible: Boolean = true, val itemSortOrder: ItemSortOrder = ItemSortOrder.MANUAL,
-                    val storePhotoUpdatedAt: Long = 0L)
+                    val storePhotoUpdatedAt: Long = 0L, val updatedAt: Long = createdAt)
 data class StoreShop(val id: String = UUID.randomUUID().toString(), val name: String, val photo: String = "", val photoSource: String = "")
 data class SuggestedProduct(val price: Double, val photo: String, val photoSource: String)
 
 enum class ItemSortOrder { MANUAL, NAME_ASC, NAME_DESC, PRICE_ASC, PRICE_DESC, SUGGESTED }
+
+const val PHONE_SYNC_REQUEST_PATH = "/phone_sync_request"
+private const val PHONE_STATE_REVISION_KEY = "phoneStateRevision"
+private const val BASE_PHONE_STATE_REVISION_KEY = "basePhoneStateRevision"
 
 fun sortItems(items: List<Item>, order: ItemSortOrder): List<Item> = when (order) {
     ItemSortOrder.MANUAL -> items.sortedBy { it.order }
@@ -47,6 +52,9 @@ object Store {
     val lists = MutableStateFlow<List<ShopList>>(emptyList())
     val shops = MutableStateFlow<List<StoreShop>>(emptyList())
     val mainListsViewMode = MutableStateFlow(0)
+    val watchPhoneConnected = MutableStateFlow(false)
+    val watchSyncReady = MutableStateFlow(false)
+    val blockedWatchEdits = MutableStateFlow(0)
     private lateinit var ctx: Context
     private val prefs get() = ctx.getSharedPreferences("mandado", 0)
     private data class EncodedPhoto(val signature: String, val hash: String, val bytes: ByteArray)
@@ -54,6 +62,10 @@ object Store {
     private val stateLock = Any()
     private val deletedListTimes = mutableMapOf<String, Long>()
     private val deletedItemTimes = mutableMapOf<String, Long>()
+    private val connectionCheckInFlight = AtomicBoolean(false)
+    @Volatile private var activeSyncRequestId: String? = null
+    @Volatile private var pendingPhoneSyncRequestId: String? = null
+    @Volatile private var lastSyncRequestAt = 0L
     private var syncOrigin = ""
     private val photoRefPrefix = "carrito-image://"
 
@@ -72,6 +84,9 @@ object Store {
             deletedItemTimes.putAll(parseDeletedItemTimes(prefs.getString("deletedItems", "{}")!!))
         }
         lists.value = parse(prefs.getString("json", "[]")!!)
+        if (ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH) && !prefs.contains(BASE_PHONE_STATE_REVISION_KEY)) {
+            prefs.edit().putLong(BASE_PHONE_STATE_REVISION_KEY, -1L).apply()
+        }
         mainListsViewMode.value = prefs.getInt("mainListsViewMode", 0).coerceIn(0, 2)
         shops.value = parseShops(prefs.getString("shops", "[]")!!)
         if (!prefs.contains("shops")) {
@@ -82,6 +97,10 @@ object Store {
         }
         val client = Wearable.getDataClient(ctx)
         val isWatch = ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)
+        if (!isWatch) {
+            watchPhoneConnected.value = true
+            watchSyncReady.value = true
+        }
         client.addListener { buf ->
             buf.forEach { e ->
                 if (e.type == DataEvent.TYPE_CHANGED && e.dataItem.uri.path == "/state")
@@ -102,11 +121,76 @@ object Store {
         }
     }
 
+    /** Refreshes phone reachability and the latest phone snapshot on Wear OS. */
+    fun refreshWatchConnection() {
+        if (!::ctx.isInitialized || !ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)) return
+        if (!connectionCheckInFlight.compareAndSet(false, true)) return
+        Wearable.getNodeClient(ctx).connectedNodes
+            .addOnSuccessListener { nodes ->
+                val connected = nodes.isNotEmpty()
+                val wasConnected = watchPhoneConnected.value
+                watchPhoneConnected.value = connected
+                if (!connected) {
+                    watchSyncReady.value = false
+                    pendingPhoneSyncRequestId = null
+                    lastSyncRequestAt = 0L
+                } else if (!wasConnected || pendingPhoneSyncRequestId == null) {
+                    watchSyncReady.value = false
+                    pendingPhoneSyncRequestId = UUID.randomUUID().toString()
+                    lastSyncRequestAt = 0L
+                }
+                if (connected) {
+                    val requestId = pendingPhoneSyncRequestId ?: UUID.randomUUID().toString().also { pendingPhoneSyncRequestId = it }
+                    val now = System.currentTimeMillis()
+                    if (!watchSyncReady.value && now - lastSyncRequestAt >= 4000L) {
+                        lastSyncRequestAt = now
+                        nodes.forEach { node ->
+                            Wearable.getMessageClient(ctx).sendMessage(node.id, PHONE_SYNC_REQUEST_PATH, requestId.toByteArray(Charsets.UTF_8))
+                                .addOnFailureListener { error -> Log.w("CarritoListSync", "Phone sync request failed: ${error.message}") }
+                        }
+                    }
+                    if (!watchSyncReady.value) {
+                        Wearable.getDataClient(ctx).getDataItems(Uri.parse("wear://*/state"))
+                            .addOnSuccessListener { buffer ->
+                                try {
+                                    buffer.forEach { item ->
+                                        val data = DataMapItem.fromDataItem(item).dataMap
+                                        if (data.getString("role") == "phone") receive(data)
+                                    }
+                                } finally {
+                                    buffer.release()
+                                }
+                            }
+                    }
+                }
+            }
+            .addOnFailureListener {
+                watchPhoneConnected.value = false
+                watchSyncReady.value = false
+            }
+            .addOnCompleteListener { connectionCheckInFlight.set(false) }
+    }
+
+    private fun watchMayEdit(): Boolean =
+        !::ctx.isInitialized || !ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH) ||
+            (watchPhoneConnected.value && watchSyncReady.value)
+
     private fun receive(data: DataMap) {
         var json = data.getString("json") ?: return
         if (data.getString("origin") == syncOrigin) return
-        mergeDeletedListTimes(parseDeletedListTimes(data.getString("deletedLists") ?: "{}"))
-        mergeDeletedItemTimes(parseDeletedItemTimes(data.getString("deletedItems") ?: "{}"))
+        val sourceRole = data.getString("role") ?: "unknown"
+        val requestId = data.getString("syncRequestId")
+        val incomingDeletedLists = parseDeletedListTimes(data.getString("deletedLists") ?: "{}")
+        val incomingDeletedItems = parseDeletedItemTimes(data.getString("deletedItems") ?: "{}")
+        val incomingPhoneRevision = data.getLong("phoneRevision", 0L)
+        val basePhoneRevision = data.getLong("basePhoneRevision", -1L)
+        val isWatch = ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)
+        if (!isWatch && sourceRole == "watch" &&
+            basePhoneRevision != prefs.getLong(PHONE_STATE_REVISION_KEY, 0L)) {
+            Log.w("CarritoListSync", "Ignoring stale watch snapshot: base=$basePhoneRevision phone=${prefs.getLong(PHONE_STATE_REVISION_KEY, 0L)}")
+            publishCurrentState()
+            return
+        }
         // Keep an explicit item-id -> asset-hash map alongside the payload. This
         // lets a receiver reconnect photos even if the Data Layer delivers a
         // merged/older JSON value with the Asset entries from the latest update.
@@ -138,7 +222,8 @@ object Store {
         val missing = hashes.filter { !syncedPhotoFile(it).isFile }
         Log.i("CarritoImageSync", "Receive state: refs=${hashes.size}, missing=${missing.size}, assetKeys=${data.keySet().count { it.startsWith("image_") }}")
         if (missing.isEmpty()) {
-            receiveResolved(json, hashes.associateWith { syncedPhotoFile(it).absolutePath })
+            receiveResolved(json, hashes.associateWith { syncedPhotoFile(it).absolutePath }, sourceRole, requestId,
+                incomingPhoneRevision, basePhoneRevision, incomingDeletedLists, incomingDeletedItems)
             return
         }
 
@@ -151,7 +236,8 @@ object Store {
                     val file = syncedPhotoFile(hash)
                     if (file.isFile) resolved[hash] = file.absolutePath
                 }
-                receiveResolved(json, resolved)
+                receiveResolved(json, resolved, sourceRole, requestId,
+                    incomingPhoneRevision, basePhoneRevision, incomingDeletedLists, incomingDeletedItems)
             }
         }
         fun fetchAsset(hash: String, asset: Asset, attempt: Int) {
@@ -193,14 +279,53 @@ object Store {
         }
     }
 
-    private fun receiveResolved(json: String, files: Map<String, String>) {
+    private fun receiveResolved(
+        json: String,
+        files: Map<String, String>,
+        sourceRole: String,
+        requestId: String?,
+        incomingPhoneRevision: Long,
+        basePhoneRevision: Long,
+        incomingDeletedLists: Map<String, Long>,
+        incomingDeletedItems: Map<String, Long>
+    ) {
         val received = runCatching { parse(json) }.getOrNull() ?: return
         fun resolve(path: String): String {
             val hash = Regex("^carrito-image://([a-fA-F0-9]{64})$").matchEntire(path)?.groupValues?.get(1)?.lowercase()
                 ?: return path
             return files[hash] ?: syncedPhotoFile(hash).takeIf { it.isFile }?.absolutePath ?: path
         }
+        var staleWatchSnapshot = false
         synchronized(stateLock) {
+            val isWatch = ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)
+            val currentPhoneRevision = prefs.getLong(PHONE_STATE_REVISION_KEY, 0L)
+            if (!isWatch && sourceRole == "watch" && basePhoneRevision != currentPhoneRevision) {
+                staleWatchSnapshot = true
+                Log.w("CarritoListSync", "Discarding watch snapshot after transfer: base=$basePhoneRevision phone=$currentPhoneRevision")
+                return@synchronized
+            }
+            if (isWatch && sourceRole == "phone") {
+                synchronized(deletedListTimes) {
+                    deletedListTimes.clear()
+                    deletedListTimes.putAll(incomingDeletedLists)
+                }
+                synchronized(deletedItemTimes) {
+                    deletedItemTimes.clear()
+                    deletedItemTimes.putAll(incomingDeletedItems)
+                }
+                val savedDeletions = prefs.edit()
+                    .putString("deletedLists", serializeDeletedListTimes())
+                    .putString("deletedItems", serializeDeletedItemTimes())
+                    .commit()
+                if (!savedDeletions) Log.e("CarritoListSync", "Could not persist authoritative phone deletion markers")
+            } else {
+                mergeDeletedListTimes(incomingDeletedLists)
+                mergeDeletedItemTimes(incomingDeletedItems)
+            }
+            if (isWatch && sourceRole == "phone") {
+                val acknowledgedRevision = maxOf(prefs.getLong(BASE_PHONE_STATE_REVISION_KEY, -1L), incomingPhoneRevision)
+                prefs.edit().putLong(BASE_PHONE_STATE_REVISION_KEY, acknowledgedRevision).apply()
+            }
             val currentLists = lists.value
             val currentById = currentLists.associateBy { it.id }
             val deleted = synchronized(deletedListTimes) { deletedListTimes.toMap() }
@@ -214,22 +339,29 @@ object Store {
             // older Data Layer copy that had not received it yet.
             val mergedReceived = received.filter { (deleted[it.id] ?: 0L) < it.createdAt } +
                 currentLists.filter { it.id !in receivedIds && (deleted[it.id] ?: 0L) < it.createdAt }
-            val localized = mergedReceived.map { list ->
-                val previous = currentById[list.id]
-                val incomingStorePhoto = resolve(list.storePhoto)
+            val localized = mergedReceived.map { incoming ->
+                val previous = currentById[incoming.id]
+                // Keep a newer local snapshot instead of replacing offline edits
+                // with an older Data Layer copy. The phone is authoritative on Wear.
+                val source = when {
+                    !isWatch && sourceRole == "watch" -> incoming
+                    previous != null && (!(isWatch && sourceRole == "phone") && previous.updatedAt >= incoming.updatedAt) -> previous
+                    else -> incoming
+                }
+                val incomingStorePhoto = resolve(source.storePhoto)
                 val keepPreviousStorePhoto = previous != null && (
-                    previous.storePhotoUpdatedAt > list.storePhotoUpdatedAt ||
+                    previous.storePhotoUpdatedAt > source.storePhotoUpdatedAt ||
                         (previous.storePhoto.isNotBlank() && File(previous.storePhoto).isFile &&
                             incomingStorePhoto.isNotBlank() && !File(incomingStorePhoto).isFile &&
-                            previous.storePhotoUpdatedAt == list.storePhotoUpdatedAt)
+                            previous.storePhotoUpdatedAt == source.storePhotoUpdatedAt)
                     )
-                list.copy(
+                source.copy(
                     storePhoto = if (keepPreviousStorePhoto) previous!!.storePhoto else incomingStorePhoto.let { path ->
                         if (path.startsWith(photoRefPrefix) && previous?.storePhoto?.let { File(it).isFile } == true) previous.storePhoto else path
                     },
-                    storePhotoSource = if (keepPreviousStorePhoto) previous!!.storePhotoSource else list.storePhotoSource,
-                    storePhotoUpdatedAt = maxOf(list.storePhotoUpdatedAt, if (keepPreviousStorePhoto) previous!!.storePhotoUpdatedAt else 0L),
-                    items = list.items.filterNot { item -> deletedItems.containsKey(deletedItemKey(list.id, item.id)) }.map { item ->
+                    storePhotoSource = if (keepPreviousStorePhoto) previous!!.storePhotoSource else source.storePhotoSource,
+                    storePhotoUpdatedAt = maxOf(source.storePhotoUpdatedAt, if (keepPreviousStorePhoto) previous!!.storePhotoUpdatedAt else 0L),
+                    items = source.items.filterNot { item -> deletedItems.containsKey(deletedItemKey(source.id, item.id)) }.map { item ->
                         val path = resolve(item.photo)
                         val previousItem = previous?.items?.firstOrNull { it.id == item.id }
                         val previousPhoto = previousItem?.photo
@@ -243,16 +375,31 @@ object Store {
                             photoSource = if (keepPreviousPhoto) previousItem!!.photoSource else item.photoSource,
                             photoUpdatedAt = maxOf(item.photoUpdatedAt, if (keepPreviousPhoto) previousItem!!.photoUpdatedAt else 0L)
                         )
-                    }
+                    },
+                    updatedAt = maxOf(source.updatedAt, previous?.updatedAt ?: 0L)
                 )
             }
             val localJson = toJson(localized)
-            if (localJson == toJson(currentLists)) return
-            val saved = prefs.edit().putString("json", localJson).commit()
-            if (!saved) Log.e("CarritoListSync", "Could not persist merged list state")
-            Log.i("CarritoListSync", "Merged state: local=${currentLists.size}, incoming=${received.size}, saved=${localized.size}, preserved=${localized.count { it.id !in receivedIds }}")
-            lists.value = localized
+            if (localJson != toJson(currentLists)) {
+                val editor = prefs.edit().putString("json", localJson)
+                if (!isWatch && sourceRole == "watch") {
+                    editor.putLong(PHONE_STATE_REVISION_KEY, currentPhoneRevision + 1L)
+                }
+                val saved = editor.commit()
+                if (!saved) Log.e("CarritoListSync", "Could not persist merged list state")
+                Log.i("CarritoListSync", "Merged state: local=${currentLists.size}, incoming=${received.size}, saved=${localized.size}, preserved=${localized.count { it.id !in receivedIds }}")
+                lists.value = localized
+            }
         }
+        if (staleWatchSnapshot) {
+            publishCurrentState()
+            return
+        }
+        val isWatch = ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)
+        if (isWatch && sourceRole == "phone" && watchPhoneConnected.value && requestId == pendingPhoneSyncRequestId) {
+            watchSyncReady.value = true
+        }
+        if (!isWatch && sourceRole == "watch") publishCurrentState()
     }
 
     private fun syncedPhotoFile(hash: String) = File(File(ctx.filesDir, "synced-photos"), "$hash.img")
@@ -305,6 +452,11 @@ object Store {
     }
 
     fun update(f: (List<ShopList>) -> List<ShopList>) {
+        if (!watchMayEdit()) {
+            blockedWatchEdits.value += 1
+            Log.w("CarritoListSync", "Ignored watch edit while phone is disconnected or lists are not synchronized")
+            return
+        }
         synchronized(stateLock) {
             val previousLists = lists.value
             val previous = previousLists.associateBy { it.id }
@@ -328,7 +480,14 @@ object Store {
             }
             val nextLists = changedLists.map { list ->
                 val old = previous[list.id]
+                val contentChanged = old != null && list.copy(updatedAt = old.updatedAt) != old
+                val updatedAt = when {
+                    old == null -> maxOf(list.updatedAt, list.createdAt, now)
+                    contentChanged -> maxOf(now, old.updatedAt + 1L)
+                    else -> maxOf(list.updatedAt, old.updatedAt)
+                }
                 list.copy(
+                    updatedAt = updatedAt,
                     storePhotoUpdatedAt = if (old == null && list.storePhoto.isNotBlank()) maxOf(list.storePhotoUpdatedAt, now)
                         else if (old != null && old.storePhoto != list.storePhoto) maxOf(now, old.storePhotoUpdatedAt + 1L)
                         else maxOf(list.storePhotoUpdatedAt, old?.storePhotoUpdatedAt ?: 0L),
@@ -343,11 +502,15 @@ object Store {
                 )
             }
             val j = toJson(nextLists)
-            val saved = prefs.edit()
+            val isWatch = ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)
+            val currentPhoneRevision = prefs.getLong(PHONE_STATE_REVISION_KEY, 0L)
+            val changedOnPhone = !isWatch && j != toJson(previousLists)
+            val editor = prefs.edit()
                 .putString("json", j)
                 .putString("deletedLists", serializeDeletedListTimes())
                 .putString("deletedItems", serializeDeletedItemTimes())
-                .commit()
+            if (changedOnPhone) editor.putLong(PHONE_STATE_REVISION_KEY, currentPhoneRevision + 1L)
+            val saved = editor.commit()
             if (!saved) Log.e("CarritoListSync", "Could not persist local list state")
             lists.value = nextLists
             Log.i("CarritoListSync", "Local state saved: before=${previousLists.size}, after=${nextLists.size}, removed=${previous.keys - nextIds}")
@@ -417,6 +580,12 @@ object Store {
         }
     }
 
+    fun publishCurrentStateForSync(requestId: String) {
+        if (!::ctx.isInitialized || ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)) return
+        activeSyncRequestId = requestId
+        publishCurrentState()
+    }
+
     private fun publishCurrentState() {
         val (listSnapshot, deletedSnapshot, deletedItemSnapshot) = synchronized(stateLock) {
             Triple(lists.value, serializeDeletedListTimes(), serializeDeletedItemTimes())
@@ -425,6 +594,13 @@ object Store {
             dataMap.putString("json", syncJson(listSnapshot, dataMap))
             dataMap.putString("deletedLists", deletedSnapshot)
             dataMap.putString("deletedItems", deletedItemSnapshot)
+            dataMap.putString("role", if (ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)) "watch" else "phone")
+            if (!ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)) {
+                dataMap.putLong("phoneRevision", prefs.getLong(PHONE_STATE_REVISION_KEY, 0L))
+                activeSyncRequestId?.let { dataMap.putString("syncRequestId", it) }
+            } else {
+                dataMap.putLong("basePhoneRevision", prefs.getLong(BASE_PHONE_STATE_REVISION_KEY, -1L))
+            }
             dataMap.putString("origin", syncOrigin)
             dataMap.putLong("t", System.nanoTime())
         }.asPutDataRequest().setUrgent()
@@ -495,44 +671,38 @@ object Store {
             .filter { it.isNotEmpty() && !Regex("^(?:mmm+|hmm+|eh+|em+|este)$", RegexOption.IGNORE_CASE).matches(it) }
             .flatMap(::parseSpoken)
 
-    /** Sugerencias: objetos que aparecen junto a los de esta lista en otras listas. */
+    /** Suggestions prioritize the selected store, then the products most often listed. */
     fun suggest(cur: ShopList): List<String> {
-        if (cur.items.isEmpty()) {
-            data class Popularity(val sameStore: Int, val total: Int, val name: String)
-            val popularity = linkedMapOf<String, Popularity>()
-            lists.value.filter { it.id != cur.id }.forEach { other ->
-                val sameStore = cur.store.isNotBlank() && other.store.trim().equals(cur.store.trim(), ignoreCase = true)
-                other.items.distinctBy { it.name.trim().lowercase() }.forEach { item ->
-                    val key = item.name.trim().lowercase()
-                    if (key.isNotBlank()) {
-                        val current = popularity[key]
-                        popularity[key] = Popularity(
-                            sameStore = (current?.sameStore ?: 0) + (if (sameStore) 1 else 0),
-                            total = (current?.total ?: 0) + 1,
-                            name = current?.name ?: item.name.trim()
-                        )
-                    }
-                }
-            }
-            return popularity.values
-                .sortedWith(compareByDescending<Popularity> { it.sameStore }
-                    .thenByDescending { it.total }
-                    .thenBy { it.name.lowercase() })
-                .map { it.name }
-        }
-        val mine = cur.items.map { it.name.lowercase() }.toSet()
-        val counts = HashMap<String, Pair<Int, String>>()
-        lists.value.filter { it.id != cur.id }.forEach { l ->
-            val names = l.items.map { it.name.lowercase() }
-            if (names.any { it in mine }) {
-                l.items.filter { it.name.lowercase() !in mine }.forEach { item ->
-                    val key = item.name.lowercase()
-                    val current = counts[key]
-                    counts[key] = (current?.first?.plus(1) ?: 1) to (current?.second ?: item.name)
+        data class Candidate(
+            val name: String,
+            val sameStore: MutableList<Pair<ShopList, Item>> = mutableListOf(),
+            val otherStores: MutableList<Pair<ShopList, Item>> = mutableListOf()
+        )
+
+        val currentNames = cur.items.map { it.name.trim().lowercase() }.toSet()
+        val candidates = linkedMapOf<String, Candidate>()
+        lists.value.filter { it.id != cur.id }.forEach { list ->
+            val isSameStore = cur.store.isNotBlank() && list.store.trim().equals(cur.store.trim(), ignoreCase = true)
+            list.items.distinctBy { it.name.trim().lowercase() }.forEach { item ->
+                val key = item.name.trim().lowercase()
+                if (key.isNotBlank() && key !in currentNames) {
+                    val candidate = candidates.getOrPut(key) { Candidate(item.name.trim()) }
+                    if (isSameStore) candidate.sameStore.add(list to item) else candidate.otherStores.add(list to item)
                 }
             }
         }
-        return counts.entries.sortedByDescending { it.value.first }.map { it.value.second }
+        fun ordered(values: List<Candidate>, sameStore: Boolean) = values
+            .sortedWith(compareByDescending<Candidate> { if (sameStore) it.sameStore.size else it.otherStores.size }
+                .thenBy { it.name.lowercase() })
+
+        val sameStoreCandidates = candidates.values.filter { it.sameStore.isNotEmpty() }
+        val otherStoreCandidates = candidates.values.filter { it.sameStore.isEmpty() }
+        return buildList {
+            addAll(ordered(sameStoreCandidates.filter { it.sameStore.size >= 2 }, sameStore = true))
+            addAll(ordered(otherStoreCandidates.filter { it.otherStores.size >= 2 }, sameStore = false))
+            addAll(ordered(sameStoreCandidates.filter { it.sameStore.size == 1 }, sameStore = true))
+            addAll(ordered(otherStoreCandidates.filter { it.otherStores.size == 1 }, sameStore = false))
+        }.map { it.name }
     }
 
     /** Reuses details from the same store first, with a cross-store price average as fallback. */
@@ -549,14 +719,15 @@ object Store {
             .toList()
         val sameStore = if (cur.store.isBlank()) emptyList() else observations.filter {
             it.first.store.trim().equals(cur.store.trim(), ignoreCase = true)
-        }
-        val storePrices = sameStore.map { it.second.price }.filter { it > 0.0 }
-        val allPrices = observations.map { it.second.price }.filter { it > 0.0 }
-        val prices = storePrices.ifEmpty { allPrices }
+        }.sortedWith(compareByDescending<Pair<ShopList, Item>> { it.first.updatedAt }.thenByDescending { it.first.createdAt })
+        val otherStores = observations.filterNot { it in sameStore }
+        val exactStorePrice = sameStore.firstOrNull { it.second.price > 0.0 }?.second?.price
+        val averagePrices = otherStores.map { it.second.price }.filter { it > 0.0 }
         val photoSourceItem = sameStore.firstOrNull { it.second.photo.isNotBlank() }
-            ?: observations.firstOrNull { it.second.photo.isNotBlank() }
+            ?: observations.sortedWith(compareByDescending<Pair<ShopList, Item>> { it.first.updatedAt }.thenByDescending { it.first.createdAt })
+                .firstOrNull { it.second.photo.isNotBlank() }
         return SuggestedProduct(
-            price = if (prices.isEmpty()) 0.0 else prices.average(),
+            price = exactStorePrice ?: if (averagePrices.isEmpty()) 0.0 else averagePrices.average(),
             photo = photoSourceItem?.second?.photo.orEmpty(),
             photoSource = photoSourceItem?.second?.photoSource.orEmpty()
         )
@@ -566,7 +737,7 @@ object Store {
         JSONObject().put("id", s.id).put("name", s.name).put("store", s.store).put("at", s.createdAt).put("active", s.active)
             .put("storePhoto", s.storePhoto).put("storePhotoSource", s.storePhotoSource).put("viewMode", s.viewMode)
             .put("suggestionsVisible", s.suggestionsVisible).put("itemSortOrder", s.itemSortOrder.name)
-            .put("storePhotoUpdatedAt", s.storePhotoUpdatedAt)
+            .put("storePhotoUpdatedAt", s.storePhotoUpdatedAt).put("updatedAt", s.updatedAt)
             .put("items", JSONArray(s.items.map { i ->
                 JSONObject().put("id", i.id).put("name", i.name).put("price", i.price).put("photo", i.photo)
                     .put("order", i.order).put("checked", i.checked).put("cart", i.cartOrder).put("photoSource", i.photoSource)
@@ -585,7 +756,7 @@ object Store {
                 }, o.getLong("at"), o.getBoolean("active"), o.optString("storePhoto", ""), o.optString("storePhotoSource", ""),
                 o.optInt("viewMode", 0), o.optBoolean("suggestionsVisible", true),
                 runCatching { ItemSortOrder.valueOf(o.optString("itemSortOrder", ItemSortOrder.MANUAL.name)) }
-                    .getOrDefault(ItemSortOrder.MANUAL), o.optLong("storePhotoUpdatedAt", 0L))
+                    .getOrDefault(ItemSortOrder.MANUAL), o.optLong("storePhotoUpdatedAt", 0L), o.optLong("updatedAt", o.optLong("at", 0L)))
         }
     }
 }
