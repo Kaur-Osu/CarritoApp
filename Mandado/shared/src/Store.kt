@@ -31,6 +31,7 @@ data class SuggestedProduct(val price: Double, val photo: String, val photoSourc
 enum class ItemSortOrder { MANUAL, NAME_ASC, NAME_DESC, PRICE_ASC, PRICE_DESC, SUGGESTED }
 
 const val PHONE_SYNC_REQUEST_PATH = "/phone_sync_request"
+const val PHONE_STATE_CHANGED_PATH = "/phone_state_changed"
 private const val PHONE_STATE_REVISION_KEY = "phoneStateRevision"
 private const val BASE_PHONE_STATE_REVISION_KEY = "basePhoneStateRevision"
 
@@ -58,6 +59,13 @@ object Store {
     private lateinit var ctx: Context
     private val prefs get() = ctx.getSharedPreferences("mandado", 0)
     private data class EncodedPhoto(val signature: String, val hash: String, val bytes: ByteArray)
+    private data class StateSnapshot(
+        val lists: List<ShopList>,
+        val deletedLists: String,
+        val deletedItems: String,
+        val isWatch: Boolean,
+        val phoneRevision: Long
+    )
     private val encodedPhotos = mutableMapOf<String, EncodedPhoto>()
     private val stateLock = Any()
     private val deletedListTimes = mutableMapOf<String, Long>()
@@ -169,6 +177,44 @@ object Store {
                 watchSyncReady.value = false
             }
             .addOnCompleteListener { connectionCheckInFlight.set(false) }
+    }
+
+    /** Re-reads the phone's committed snapshot after its live-change notification. */
+    fun refreshFromPhone(expectedRevision: Long) {
+        if (!::ctx.isInitialized || !ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)) return
+        val handler = Handler(Looper.getMainLooper())
+        fun fetch(attempt: Int) {
+            Wearable.getDataClient(ctx).getDataItems(Uri.parse("wear://*/state"))
+                .addOnSuccessListener { buffer ->
+                    var latestPhoneState: DataMap? = null
+                    try {
+                        buffer.forEach { item ->
+                            val candidate = DataMapItem.fromDataItem(item).dataMap
+                            if (candidate.getString("role") == "phone" &&
+                                candidate.getLong("phoneRevision", 0L) >= expectedRevision &&
+                                (latestPhoneState == null || candidate.getLong("phoneRevision", 0L) >
+                                    latestPhoneState!!.getLong("phoneRevision", 0L))) {
+                                latestPhoneState = candidate
+                            }
+                        }
+                    } finally {
+                        buffer.release()
+                    }
+                    if (latestPhoneState != null) {
+                        Log.i("CarritoListSync", "Applying live phone snapshot revision=${latestPhoneState!!.getLong("phoneRevision", 0L)}")
+                        receive(latestPhoneState!!)
+                    } else if (attempt < 8) {
+                        handler.postDelayed({ fetch(attempt + 1) }, 350L)
+                    } else {
+                        Log.w("CarritoListSync", "Phone snapshot revision $expectedRevision not available after retries")
+                    }
+                }
+                .addOnFailureListener { error ->
+                    if (attempt < 8) handler.postDelayed({ fetch(attempt + 1) }, 350L)
+                    else Log.w("CarritoListSync", "Could not refresh from phone: ${error.message}")
+                }
+        }
+        fetch(0)
     }
 
     private fun watchMayEdit(): Boolean =
@@ -587,16 +633,24 @@ object Store {
     }
 
     private fun publishCurrentState() {
-        val (listSnapshot, deletedSnapshot, deletedItemSnapshot) = synchronized(stateLock) {
-            Triple(lists.value, serializeDeletedListTimes(), serializeDeletedItemTimes())
+        val isWatch = ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)
+        val snapshot = synchronized(stateLock) {
+            StateSnapshot(
+                lists.value,
+                serializeDeletedListTimes(),
+                serializeDeletedItemTimes(),
+                isWatch,
+                if (isWatch) -1L else prefs.getLong(PHONE_STATE_REVISION_KEY, 0L)
+            )
         }
+        val phoneRevision = snapshot.phoneRevision
         val req = PutDataMapRequest.create("/state").apply {
-            dataMap.putString("json", syncJson(listSnapshot, dataMap))
-            dataMap.putString("deletedLists", deletedSnapshot)
-            dataMap.putString("deletedItems", deletedItemSnapshot)
-            dataMap.putString("role", if (ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)) "watch" else "phone")
-            if (!ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)) {
-                dataMap.putLong("phoneRevision", prefs.getLong(PHONE_STATE_REVISION_KEY, 0L))
+            dataMap.putString("json", syncJson(snapshot.lists, dataMap))
+            dataMap.putString("deletedLists", snapshot.deletedLists)
+            dataMap.putString("deletedItems", snapshot.deletedItems)
+            dataMap.putString("role", if (snapshot.isWatch) "watch" else "phone")
+            if (!snapshot.isWatch) {
+                dataMap.putLong("phoneRevision", phoneRevision)
                 activeSyncRequestId?.let { dataMap.putString("syncRequestId", it) }
             } else {
                 dataMap.putLong("basePhoneRevision", prefs.getLong(BASE_PHONE_STATE_REVISION_KEY, -1L))
@@ -605,6 +659,31 @@ object Store {
             dataMap.putLong("t", System.nanoTime())
         }.asPutDataRequest().setUrgent()
         Wearable.getDataClient(ctx).putDataItem(req)
+            .addOnSuccessListener {
+                if (!snapshot.isWatch) {
+                    Log.i("CarritoListSync", "Published phone snapshot revision=$phoneRevision")
+                    notifyConnectedWatches(phoneRevision)
+                }
+            }
+            .addOnFailureListener { error ->
+                Log.e("CarritoListSync", "Could not publish state revision=$phoneRevision: ${error.message}")
+            }
+    }
+
+    private fun notifyConnectedWatches(phoneRevision: Long) {
+        Wearable.getNodeClient(ctx).connectedNodes
+            .addOnSuccessListener { nodes ->
+                nodes.forEach { node ->
+                    Wearable.getMessageClient(ctx)
+                        .sendMessage(node.id, PHONE_STATE_CHANGED_PATH, phoneRevision.toString().toByteArray(Charsets.UTF_8))
+                        .addOnFailureListener { error ->
+                            Log.w("CarritoListSync", "Live update notification failed for ${node.displayName}: ${error.message}")
+                        }
+                }
+            }
+            .addOnFailureListener { error ->
+                Log.w("CarritoListSync", "Could not find connected watches for live update: ${error.message}")
+            }
     }
 
     fun updateList(id: String, f: (ShopList) -> ShopList) = update { l -> l.map { if (it.id == id) f(it) else it } }
